@@ -1,5 +1,6 @@
 import os, numpy as np
-from sharded_tensorops import smean, svar, imean, ivar
+from sharded_tensorops import svar, imean, ivar
+from sharded_tensorops2 import smean
 from tinygrad import Tensor, nn, Device
 
 np.random.seed(42)

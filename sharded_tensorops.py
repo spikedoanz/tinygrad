@@ -109,8 +109,12 @@ def smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = Fal
     reduce_elements = prod([self.shape[d] for d in reduce_dims])
     preserved_elements = prod([self.shape[d] for d in preserved_dims]) if preserved_dims else 1
     
+    # Permute tensor to put preserved dims first, then reduce dims
+    perm = preserved_dims + reduce_dims
+    t_permuted = t.permute(*perm) if perm else t
+    
     # Reshape tensor to [preserved_elements, reduce_elements]
-    t_flat = t.reshape(preserved_elements, reduce_elements)
+    t_flat = t_permuted.reshape(preserved_elements, reduce_elements)
     
     # Chunk along the reduction dimension
     max_chunk_size = MAX_BUFFER_SIZE // max(1, preserved_elements)
@@ -122,28 +126,34 @@ def smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = Fal
         # Sum each chunk and accumulate
         total_sum = None
         for chunk in chunks:
+            chunk.realize()  # Materialize the chunk
             chunk_sum = chunk.cast(sum_acc_dtype(self.dtype)).sum(axis=1, keepdim=True)
+            chunk_sum.realize()
             total_sum = chunk_sum if total_sum is None else total_sum + chunk_sum
         
         result = total_sum.div(reduce_elements).cast(output_dtype)
     else:
-        # No chunking needed
-        result = t_flat.mean(axis=1, keepdim=True)
+        # No chunking needed - use same pattern as chunked case for consistency
+        numerator = t_flat.cast(sum_acc_dtype(self.dtype)).sum(axis=1, keepdim=True)
+        result = numerator.div(reduce_elements).cast(output_dtype)
     
-    # Reshape back to original preserved dimensions
+    # Reshape back to original dimension structure
     if preserved_dims:
         preserved_shape = [self.shape[d] for d in preserved_dims]
         if keepdim:
-            # Insert 1s for reduced dimensions
-            final_shape = list(self.shape)
-            for d in reduce_dims:
-                final_shape[d] = 1
-            result = result.reshape(*final_shape)
+            # Build shape with preserved dims and 1s for reduced dims
+            result = result.reshape(*preserved_shape, *([1] * len(reduce_dims)))
+            # Unpermute to restore original dimension order
+            inv_perm = [perm.index(i) for i in range(len(perm))]
+            result = result.permute(*inv_perm)
         else:
+            # Result stays as [preserved_shape]
             result = result.reshape(*preserved_shape)
     elif keepdim:
+        # All dims were reduced, keep all as 1s
         result = result.reshape(*[1] * len(self.shape))
     else:
+        # All dims reduced, return scalar
         result = result.squeeze()
     
     return result
@@ -187,7 +197,8 @@ def smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = Fal
     raise RuntimeError(f"Unable to shard tensor with shape {self.shape}")
     """
 
-print(smean(Tensor.randn(1,1,256,256,256), axis=[-1]))
+print(smean(Tensor.randn(1,30,256*256*256), axis=[-1]))
+print(smean(Tensor.randn(1,30,256*256*256), axis=[-1]).realize())
 
 
 def _smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = False) -> Tensor:
