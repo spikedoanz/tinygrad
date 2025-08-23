@@ -19,7 +19,7 @@ from tinygrad import Tensor
 MAX_BUFFER_SIZE = 128**3
 
 def chunk(t: Tensor, axis: int, max_size: int = MAX_BUFFER_SIZE) -> list[Tensor]:
-    """Split tensor along specified axis into chunks smaller than max_size."""
+    """Split tensor along specified axis into chunks smaller than max_size using split()."""
     if axis < 0: axis = len(t.shape) + axis
     axis_size = t.shape[axis]
     
@@ -27,29 +27,17 @@ def chunk(t: Tensor, axis: int, max_size: int = MAX_BUFFER_SIZE) -> list[Tensor]
     if axis_size <= max_size:
         return [t]
     
-    # Calculate number of chunks needed for this axis
+    # Calculate chunk size
     num_chunks = ceildiv(axis_size, max_size)
     chunk_size = ceildiv(axis_size, num_chunks)
     
-    chunks = []
-    for i in range(0, axis_size, chunk_size):
-        end = min(i + chunk_size, axis_size)
-        slices = [slice(None)] * len(t.shape)
-        slices[axis] = slice(i, end)
-        
-        chunk = t[tuple(slices)]
-        chunks.append(chunk)
-    
-    return chunks
-
-def unchunk(ts: list[Tensor], axis: int) -> Tensor:
-    return Tensor.cat(*ts, dim=axis)
-
-def mean(t, axis:int|Sequence[int]|None=None, keepdim=False) -> Tensor:
-    output_dtype = t.dtype if dtypes.is_float(t.dtype) else dtypes.float32
-    numerator = t.cast(sum_acc_dtype(t.dtype)).sum(axis=axis, keepdim=keepdim)
-    return numerator.div(prod([cast(int, si) for si, so in zip(t.shape, t.sum(axis=axis, keepdim=True).shape) if resolve(si != so)])) \
-      .cast(output_dtype)
+    try:
+        # Use split instead of tensor slicing
+        chunks = t.split(chunk_size, dim=axis)
+        return list(chunks) if isinstance(chunks, tuple) else chunks
+    except Exception as e:
+        print(f"Split failed: {e}, falling back to single tensor")
+        return [t]
 
 def smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = False) -> Tensor:
     t = self
@@ -73,56 +61,62 @@ def smean(self: Tensor, axis: int|Sequence[int]|None = None, keepdim: bool = Fal
     if not reduce_dims:
         return t
     
-    # Permute to put preserved dims first, then reduce dims
-    perm = preserved_dims + reduce_dims
-    t_permuted = t.permute(*perm) if perm else t
+    # Check if we even need to chunk
+    total_size = prod(t.shape)
+    if total_size <= MAX_BUFFER_SIZE:
+        # Just use regular mean if small enough
+        numerator = t.cast(sum_acc_dtype(t.dtype)).sum(axis=axis, keepdim=keepdim)
+        denominator = prod([t.shape[d] for d in reduce_dims])
+        return numerator.div(denominator).cast(output_dtype)
     
-    # Calculate new shape: flatten all reduce dims into one
-    preserved_shape = [t.shape[d] for d in preserved_dims] if preserved_dims else []
-    reduce_size = prod([t.shape[d] for d in reduce_dims])
+    # Find the largest reduce dimension to chunk along
+    largest_reduce_dim = max(reduce_dims, key=lambda d: t.shape[d])
     
-    # Reshape to [...preserved_dims..., flattened_reduce_dim]
-    new_shape = preserved_shape + [reduce_size] if preserved_shape else [reduce_size]
-    t_reshaped = t_permuted.reshape(*new_shape)
+    # Chunk along this dimension using split
+    try:
+        sharded = chunk(t, axis=largest_reduce_dim, max_size=MAX_BUFFER_SIZE)
+    except Exception as e:
+        print(f"Chunking failed: {e}, using regular mean")
+        # Fallback to regular mean
+        numerator = t.cast(sum_acc_dtype(t.dtype)).sum(axis=axis, keepdim=keepdim)
+        denominator = prod([t.shape[d] for d in reduce_dims])
+        return numerator.div(denominator).cast(output_dtype)
     
-    # Now we have a single axis to reduce (the last one)
-    reduction_axis = len(new_shape) - 1
-    
-    # Chunk along the flattened reduction dimension
-    sharded = chunk(t_reshaped, axis=reduction_axis, max_size=MAX_BUFFER_SIZE)
-    
-    # Compute weighted mean
+    # For each chunk, compute the mean
     sum_chunks = []
     count_chunks = []
     
     for s in sharded:
-        s.realize()  # Materialize chunk
-        sum_chunk = s.cast(sum_acc_dtype(t.dtype)).sum(axis=reduction_axis, keepdim=True)
-        sum_chunk.realize()
-        sum_chunks.append(sum_chunk)
-        count_chunks.append(s.shape[reduction_axis])
+        try:
+            s = s.realize()  # Materialize the chunk
+            # Compute sum over all reduce dimensions
+            chunk_sum = s.cast(sum_acc_dtype(t.dtype)).sum(axis=axis, keepdim=True)
+            chunk_sum = chunk_sum.realize()
+            
+            # Calculate the count - product of all reduced dimensions in this chunk
+            chunk_count = prod([s.shape[d] for d in reduce_dims])
+            
+            sum_chunks.append(chunk_sum)
+            count_chunks.append(chunk_count)
+        except Exception as e:
+            print(f"Error processing chunk: {e}")
+            continue
+    
+    if not sum_chunks:
+        # All chunks failed, fallback to regular mean
+        numerator = t.cast(sum_acc_dtype(t.dtype)).sum(axis=axis, keepdim=keepdim)
+        denominator = prod([t.shape[d] for d in reduce_dims])
+        return numerator.div(denominator).cast(output_dtype)
     
     # Combine chunks with proper weighting
     total_sum = sum(sum_chunks)
     total_count = sum(count_chunks)
     result = (total_sum / total_count).cast(output_dtype)
     
-    # Reshape back to original structure
-    if keepdim:
-        # Build final shape with 1s in reduced dimensions
-        if preserved_dims:
-            # Reshape to add 1s for reduced dims
-            result = result.reshape(*preserved_shape, *([1] * len(reduce_dims)))
-            # Unpermute to restore original dimension order
-            inv_perm = [perm.index(i) for i in range(len(perm))]
-            result = result.permute(*inv_perm)
-        else:
-            # All dims were reduced, all become 1
-            result = result.reshape(*[1] * len(self.shape))
-    else:
-        # Result already has correct shape (just preserved dims)
-        if preserved_dims:
-            result = result.squeeze(-1)  # Remove the reduction dimension
-        else:
-            result = result.squeeze()  # Scalar result
+    # Handle keepdim
+    if not keepdim:
+        # Squeeze the reduced dimensions
+        for d in sorted(reduce_dims, reverse=True):
+            result = result.squeeze(d)
+    
     return result

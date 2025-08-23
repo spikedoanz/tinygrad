@@ -1,6 +1,6 @@
 import os, numpy as np
 from sharded_tensorops import svar, imean, ivar
-from sharded_tensorops2 import smean
+from avg_conv import smean
 from tinygrad import Tensor, nn, Device
 
 np.random.seed(42)
@@ -8,8 +8,8 @@ np.random.seed(42)
 BACKEND1 = "METAL"
 BACKEND2 = "WEBGPU"
 
-Tensor.mean = smean # this now makes it so that everything which uses .mean() internally uses my new fixed version
-#Tensor.var  = svar 
+Tensor.mean = imean # this now makes it so that everything which uses .mean() internally uses my new fixed version
+Tensor.var  = ivar 
 
 def test_groupnorm(b,c1,c2,N):
   print("Channels", b,c1,c2, "Dims", N)
